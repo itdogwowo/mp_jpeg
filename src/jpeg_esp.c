@@ -251,6 +251,57 @@ static MP_DEFINE_CONST_FUN_OBJ_2(jpeg_decoder_get_img_info_obj, jpeg_decoder_get
 // }
 // static MP_DEFINE_CONST_FUN_OBJ_2(jpeg_decoder_decode_obj, jpeg_decoder_decode);
 
+// Add the decode_into function to the jpeg module
+static mp_obj_t jpeg_decoder_decode_into(size_t n_args, const mp_obj_t *args) {
+    mp_obj_t self_in = args[0];
+    mp_obj_t jpeg_data = args[1];
+    mp_obj_t out_buffer = args[2];  // 必需參數
+    
+    jpeg_decoder_obj_t *self = jpeg_decoder_prepare(self_in, jpeg_data);
+    
+    // Get external buffer information
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(out_buffer, &bufinfo, MP_BUFFER_WRITE);
+    
+    // Verify buffer size and alignment
+    if (bufinfo.len < self->io.out_size) {
+        mp_raise_msg_varg(&mp_type_ValueError, 
+            MP_ERROR_TEXT("Buffer too small: need %d bytes, got %d"), 
+            self->io.out_size, bufinfo.len);
+    }
+    
+    // Check if it is an aligned buffer (optional, but recommended for DMA)
+    if (((uintptr_t)bufinfo.buf & 0x0F) != 0) {
+        mp_printf(&mp_plat_print, 
+            "Warning: Buffer not 16-byte aligned, may impact DMA performance\n");
+    }
+    
+    // Decode to external buffer
+    if (self->block_pos < self->block_counts) {
+        // Temporarily replace the output buffer pointer
+        uint8_t *orig_buf = self->io.outbuf;
+        self->io.outbuf = (uint8_t *)bufinfo.buf;
+        
+        jpeg_error_t ret = jpeg_dec_process(self->handle, &self->io);
+        
+        // Restore internal buffer pointer
+        self->io.outbuf = orig_buf;
+        
+        if (ret != JPEG_ERR_OK) {
+            jpeg_err_to_mp_exception(ret, "JPEG decoding failed");
+        }
+        
+        self->block_pos++;
+        
+        // Returns the number of bytes actually written (following the readinto convention)
+        return mp_obj_new_int(self->io.out_size);
+    }
+    
+    return mp_obj_new_int(0);  // No more data
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(jpeg_decoder_decode_into_obj, 3, 3, jpeg_decoder_decode_into);
+
+
 static mp_obj_t jpeg_decoder_decode_block(mp_obj_t self_in, mp_obj_t jpeg_data) {
     jpeg_decoder_obj_t *self = jpeg_decoder_prepare(self_in, jpeg_data);
     // decode the next block
@@ -290,6 +341,7 @@ static const mp_rom_map_elem_t jpeg_decoder_locals_dict_table[] = {
     // {MP_ROM_QSTR(MP_QSTR_decode), MP_ROM_PTR(&jpeg_decoder_decode_obj)},
     // {MP_ROM_QSTR(MP_QSTR_decode_block), MP_ROM_PTR(&jpeg_decoder_decode_block_obj)},
     {MP_ROM_QSTR(MP_QSTR_decode), MP_ROM_PTR(&jpeg_decoder_decode_block_obj)},
+    {MP_ROM_QSTR(MP_QSTR_decode_into), MP_ROM_PTR(&jpeg_decoder_decode_into_obj)},
     {MP_ROM_QSTR(MP_QSTR_get_img_info), MP_ROM_PTR(&jpeg_decoder_get_img_info_obj)},
     {MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&jpeg_decoder_del_obj)},
     {MP_ROM_QSTR(MP_QSTR___enter__), MP_ROM_PTR(&mp_identity_obj)},
