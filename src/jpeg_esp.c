@@ -112,24 +112,27 @@ static mp_obj_t jpeg_decoder_make_new(const mp_obj_type_t *type, size_t n_args, 
     self->block_pos = 0;
     self->block_counts = 0;
     self->handle = NULL;
-
     self->config = (jpeg_dec_config_t)DEFAULT_JPEG_DEC_CONFIG();
     self->config.block_enable = parsed_args[ARG_block].u_bool;
-    if (parsed_args[ARG_rotation].u_obj != mp_const_none) {
-        self->config.rotate = jpeg_get_rotation_code(parsed_args[ARG_rotation].u_int);
-    }
+    
+    // Fix: Use u_int directly; no need to check u_obj.
+    self->config.rotate = jpeg_get_rotation_code(parsed_args[ARG_rotation].u_int);
+    
+    // Fix: Correctly checks pixel_format
     if (parsed_args[ARG_pixel_format].u_obj != mp_const_none) {
         self->config.output_type = jpeg_get_format_code(mp_obj_str_get_str(parsed_args[ARG_pixel_format].u_obj));
     }
+    
     if (parsed_args[ARG_scale_width].u_int > 0 && parsed_args[ARG_scale_height].u_int > 0) {
         self->config.scale.width = parsed_args[ARG_scale_width].u_int;
         self->config.scale.height = parsed_args[ARG_scale_height].u_int;
     }
+    
     if (parsed_args[ARG_clipper_width].u_int > 0 && parsed_args[ARG_clipper_height].u_int > 0) {
         self->config.clipper.width = parsed_args[ARG_clipper_width].u_int;
         self->config.clipper.height = parsed_args[ARG_clipper_height].u_int;
     }
-
+    
     if (self->config.block_enable) {
         if (self->config.rotate != JPEG_ROTATE_0D) {
             mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Block decoding is only supported for rotation 0"));
@@ -141,13 +144,10 @@ static mp_obj_t jpeg_decoder_make_new(const mp_obj_type_t *type, size_t n_args, 
             mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Block decoding does not support clipping"));
         }
     }
-
-    if (parsed_args[ARG_return_bytes].u_bool) {
-        self->return_bytes = true;
-    } else {
-        self->return_bytes = false;
-    }
-
+    
+    self->return_bytes = parsed_args[ARG_return_bytes].u_bool;
+    
+    // Open the JPEG decoder
     jpeg_error_t ret = jpeg_dec_open(&self->config, &self->handle);
     if (ret != JPEG_ERR_OK) {
         jpeg_err_to_mp_exception(ret, "Failed to initialize JPEG decoder object");
