@@ -112,27 +112,24 @@ static mp_obj_t jpeg_decoder_make_new(const mp_obj_type_t *type, size_t n_args, 
     self->block_pos = 0;
     self->block_counts = 0;
     self->handle = NULL;
+
     self->config = (jpeg_dec_config_t)DEFAULT_JPEG_DEC_CONFIG();
     self->config.block_enable = parsed_args[ARG_block].u_bool;
-    
-    // Fix: Use u_int directly; no need to check u_obj.
-    self->config.rotate = jpeg_get_rotation_code(parsed_args[ARG_rotation].u_int);
-    
-    // Fix: Correctly checks pixel_format
+    if (parsed_args[ARG_rotation].u_obj != mp_const_none) {
+        self->config.rotate = jpeg_get_rotation_code(parsed_args[ARG_rotation].u_int);
+    }
     if (parsed_args[ARG_pixel_format].u_obj != mp_const_none) {
         self->config.output_type = jpeg_get_format_code(mp_obj_str_get_str(parsed_args[ARG_pixel_format].u_obj));
     }
-    
     if (parsed_args[ARG_scale_width].u_int > 0 && parsed_args[ARG_scale_height].u_int > 0) {
         self->config.scale.width = parsed_args[ARG_scale_width].u_int;
         self->config.scale.height = parsed_args[ARG_scale_height].u_int;
     }
-    
     if (parsed_args[ARG_clipper_width].u_int > 0 && parsed_args[ARG_clipper_height].u_int > 0) {
         self->config.clipper.width = parsed_args[ARG_clipper_width].u_int;
         self->config.clipper.height = parsed_args[ARG_clipper_height].u_int;
     }
-    
+
     if (self->config.block_enable) {
         if (self->config.rotate != JPEG_ROTATE_0D) {
             mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Block decoding is only supported for rotation 0"));
@@ -144,10 +141,13 @@ static mp_obj_t jpeg_decoder_make_new(const mp_obj_type_t *type, size_t n_args, 
             mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Block decoding does not support clipping"));
         }
     }
-    
-    self->return_bytes = parsed_args[ARG_return_bytes].u_bool;
-    
-    // Open the JPEG decoder
+
+    if (parsed_args[ARG_return_bytes].u_bool) {
+        self->return_bytes = true;
+    } else {
+        self->return_bytes = false;
+    }
+
     jpeg_error_t ret = jpeg_dec_open(&self->config, &self->handle);
     if (ret != JPEG_ERR_OK) {
         jpeg_err_to_mp_exception(ret, "Failed to initialize JPEG decoder object");
@@ -251,55 +251,120 @@ static MP_DEFINE_CONST_FUN_OBJ_2(jpeg_decoder_get_img_info_obj, jpeg_decoder_get
 // }
 // static MP_DEFINE_CONST_FUN_OBJ_2(jpeg_decoder_decode_obj, jpeg_decoder_decode);
 
-// Add the decode_into function to the jpeg module
-static mp_obj_t jpeg_decoder_decode_into(size_t n_args, const mp_obj_t *args) {
-    mp_obj_t self_in = args[0];
-    mp_obj_t jpeg_data = args[1];
-    mp_obj_t out_buffer = args[2];  // 必需參數
-    
+// decode_into(self, jpeg_data, out_buffer, *, blocks=0) -> bool
+//
+// blocks 語義：
+// - blocks=0 (default): FULL，從目前進度一路做到完成一輪
+// - blocks>0: 步進 blocks 個 block（若不足則做到完成）
+// - blocks<0: ValueError
+//
+// 回傳：
+// - True  : 本次呼叫結束後完成一輪（framebuffer 可用）
+// - False : 尚未完成（只在 block=True 且 blocks>0 且 remaining>blocks 時會發生）
+//
+// 特性：auto-rewind
+// - 若上一輪已完成且你不換圖，下一次呼叫會在 prepare() 內自動 reset，開始新一輪
+static mp_obj_t jpeg_decoder_decode_into(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_blocks };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_blocks, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} }, // default FULL
+    };
+
+    mp_arg_val_t parsed[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 3, pos_args + 3, kw_args,
+                     MP_ARRAY_SIZE(allowed_args), allowed_args, parsed);
+
+    mp_obj_t self_in = pos_args[0];
+    mp_obj_t jpeg_data = pos_args[1];
+    mp_obj_t out_buffer = pos_args[2];
+
     jpeg_decoder_obj_t *self = jpeg_decoder_prepare(self_in, jpeg_data);
-    
-    // Get external buffer information
+
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(out_buffer, &bufinfo, MP_BUFFER_WRITE);
-    
-    // Verify buffer size and alignment
-    if (bufinfo.len < self->io.out_size) {
-        mp_raise_msg_varg(&mp_type_ValueError, 
-            MP_ERROR_TEXT("Buffer too small: need %d bytes, got %d"), 
-            self->io.out_size, bufinfo.len);
-    }
-    
-    // Check if it is an aligned buffer (optional, but recommended for DMA)
+
+    // alignment warning (optional)
     if (((uintptr_t)bufinfo.buf & 0x0F) != 0) {
-        mp_printf(&mp_plat_print, 
+        mp_printf(&mp_plat_print,
             "Warning: Buffer not 16-byte aligned, may impact DMA performance\n");
     }
-    
-    // Decode to external buffer
-    if (self->block_pos < self->block_counts) {
-        // Temporarily replace the output buffer pointer
-        uint8_t *orig_buf = self->io.outbuf;
+
+    mp_int_t blocks = parsed[ARG_blocks].u_int;
+    if (blocks < 0) {
+        mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("blocks must be >= 0"));
+    }
+
+    // --- Non-block mode: always one-shot FULL ---
+    if (!self->config.block_enable) {
+        if (bufinfo.len < (size_t)self->io.out_size) {
+            mp_raise_msg_varg(&mp_type_ValueError,
+                MP_ERROR_TEXT("Buffer too small: need %d bytes, got %d"),
+                self->io.out_size, (int)bufinfo.len);
+        }
+
+        uint8_t *orig = self->io.outbuf;
         self->io.outbuf = (uint8_t *)bufinfo.buf;
-        
+
         jpeg_error_t ret = jpeg_dec_process(self->handle, &self->io);
-        
-        // Restore internal buffer pointer
-        self->io.outbuf = orig_buf;
-        
+
+        self->io.outbuf = orig;
+
         if (ret != JPEG_ERR_OK) {
             jpeg_err_to_mp_exception(ret, "JPEG decoding failed");
         }
-        
-        self->block_pos++;
-        
-        // Returns the number of bytes actually written (following the readinto convention)
-        return mp_obj_new_int(self->io.out_size);
+
+        // one-shot always completes a "round"
+        self->block_pos = self->block_counts;
+        return mp_const_true;
     }
-    
-    return mp_obj_new_int(0);  // No more data
+
+    // --- Block mode ---
+    // blocks==0 => FULL (run to end), blocks>0 => step
+    mp_int_t remaining = self->block_counts - self->block_pos;
+    if (remaining <= 0) {
+        // already done for this round
+        return mp_const_true;
+    }
+
+    mp_int_t todo = (blocks == 0) ? remaining : blocks;
+    if (todo > remaining) {
+        todo = remaining; // saturate
+    }
+
+    // Need full framebuffer: block_counts * blk_size
+    size_t blk_size = (size_t)self->io.out_size;
+    size_t need = (size_t)self->block_counts * blk_size;
+    if (bufinfo.len < need) {
+        mp_raise_msg_varg(&mp_type_ValueError,
+            MP_ERROR_TEXT("Framebuffer too small: need %d bytes, got %d"),
+            (int)need, (int)bufinfo.len);
+    }
+
+    uint8_t *base = (uint8_t *)bufinfo.buf;
+    uint8_t *orig = self->io.outbuf;
+
+    for (mp_int_t i = 0; i < todo; i++) {
+        mp_int_t idx = self->block_pos; // current block index
+        self->io.outbuf = base + ((size_t)idx * blk_size);
+
+        jpeg_error_t ret = jpeg_dec_process(self->handle, &self->io);
+        if (ret != JPEG_ERR_OK) {
+            self->io.outbuf = orig;
+            jpeg_err_to_mp_exception(ret, "JPEG decoding failed");
+        }
+
+        self->block_pos++;
+    }
+
+    self->io.outbuf = orig;
+
+    // done for this round?
+    if (self->block_pos >= self->block_counts) {
+        return mp_const_true;
+    }
+    return mp_const_false;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(jpeg_decoder_decode_into_obj, 3, 3, jpeg_decoder_decode_into);
+static MP_DEFINE_CONST_FUN_OBJ_KW(jpeg_decoder_decode_into_obj, 3, jpeg_decoder_decode_into);
 
 
 static mp_obj_t jpeg_decoder_decode_block(mp_obj_t self_in, mp_obj_t jpeg_data) {
