@@ -253,17 +253,17 @@ static MP_DEFINE_CONST_FUN_OBJ_2(jpeg_decoder_get_img_info_obj, jpeg_decoder_get
 
 // decode_into(self, jpeg_data, out_buffer, *, blocks=0) -> bool
 //
-// blocks 語義：
-// - blocks=0 (default): FULL，從目前進度一路做到完成一輪
-// - blocks>0: 步進 blocks 個 block（若不足則做到完成）
+// blocks semantics:
+// - blocks=0 (default): FULL; continue from current progress until one full frame is completed
+// - blocks>0: STEP; decode up to `blocks` blocks from current progress (or finish the frame earlier)
 // - blocks<0: ValueError
 //
-// 回傳：
-// - True  : 本次呼叫結束後完成一輪（framebuffer 可用）
-// - False : 尚未完成（只在 block=True 且 blocks>0 且 remaining>blocks 時會發生）
+// Return value:
+// - True  : this call completes one full decode round (framebuffer is ready)
+// - False : not finished yet (only possible when block=True and blocks>0 and remaining>blocks)
 //
-// 特性：auto-rewind
-// - 若上一輪已完成且你不換圖，下一次呼叫會在 prepare() 內自動 reset，開始新一輪
+// Behavior: auto-rewind
+// - After a round is completed, calling decode_into() again with the same jpeg_data will auto-reset in prepare() and start a new round
 static mp_obj_t jpeg_decoder_decode_into(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_blocks };
     static const mp_arg_t allowed_args[] = {
