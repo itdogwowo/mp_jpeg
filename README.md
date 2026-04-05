@@ -122,6 +122,61 @@ This simplifies animation loops (you control whether to call again or switch to 
 - If `block=True`:
   - `out_buffer` must be large enough to hold the **full frame** (because the module writes each block into the correct offset automatically)
 
+### Practical guide
+#### 1) Choose pixel format and size the framebuffer
+- `RGB565_BE` / `RGB565_LE` / `CbYCrY`: 2 bytes per pixel
+- `RGB888`: 3 bytes per pixel
+
+```python
+import jpeg
+
+img = open("image.jpg", "rb").read()
+dec = jpeg.Decoder(pixel_format="RGB565_LE", rotation=0, block=True)
+info = dec.get_img_info(img)
+w, h = info[0], info[1]
+
+bytes_per_pixel = 2
+fb = bytearray(w * h * bytes_per_pixel)
+```
+
+#### 2) Full decode (simple, highest throughput per call)
+Use this when you can afford decoding the whole frame in one call.
+
+```python
+done = dec.decode_into(img, fb)  # blocks defaults to 0
+if done:
+    pass
+```
+
+#### 3) STEP decode (cooperative scheduling, UI-friendly)
+Use this when you want to spread decoding across multiple iterations to keep the UI responsive.
+
+```python
+done = dec.decode_into(img, fb, blocks=1)
+if done:
+    pass
+```
+
+#### 4) Correct loop pattern for STEP mode
+`decode_into(..., blocks>0)` can return `False` until the image is complete.
+
+```python
+while True:
+    done = dec.decode_into(img, fb, blocks=1)
+    if done:
+        break
+    # do other work here (render UI, poll input, etc.)
+```
+
+### When to use `decode_into` vs `decode`
+- Prefer `decode_into` when your goal is a full framebuffer for display (avoids Python slice assembly and reduces GC pressure).
+- Use `decode(block=True)` when you need raw block bytes and want to handle placement/output yourself.
+
+### Notes and caveats
+- STEP mode is meaningful when using `block=True` and `blocks>0`.
+- `block=True` has limitations: rotation must be 0, and scaling/clipping are not supported.
+- The decoder auto-rewinds after completing a full round when you call `decode_into()` again with the same `jpeg_data`, which is convenient for animation loops.
+
 ---
 
 # Encoder
@@ -160,18 +215,19 @@ Returns `bytes`.
 Use the provided `benchmark.py` (updated for the new bool-return `decode_into` API).
 
 ## Test image
-- Resolution: **160×160**
-- JPEG size: **9019 bytes**
+- Resolution: **240×240**
+- JPEG size: **32627 bytes**
+- Blocks: **30** (block height: **8**)
 - NR = 100
 
 ## Decoder results
 
 | Format     | FPS normal decode (`decode`, block=False) | FPS block decode (`decode`, block=True) | FPS block decode + write (python slice) | FPS decode_into step (blocks=1) | FPS decode_into full (blocks=0) |
 |-----------|--------------------------------------------|------------------------------------------|------------------------------------------|----------------------------------|----------------------------------|
-| RGB565_BE | 62.31 | 97.47  | 17.95 | 76.98 | 77.64 |
-| RGB565_LE | 62.31 | 97.37  | 20.28 | 76.92 | 77.76 |
-| RGB888    | 50.84 | 91.83  | 14.56 | 66.53 | 67.11 |
-| CbYCrY    | 62.42 | 106.61 | 20.11 | 77.28 | 78.00 |
+| RGB565_BE | 18.47 | 24.65 | 4.82 | 21.38 | 21.52 |
+| RGB565_LE | 18.46 | 24.65 | 4.82 | 21.40 | 21.52 |
+| RGB888    | 16.49 | 23.75 | 3.43 | 20.19 | 20.34 |
+| CbYCrY    | 18.92 | 26.03 | 4.85 | 21.99 | 22.13 |
 
 ### Notes
 - `block decode` is fastest when you only need block output (no full-frame assembly).
@@ -182,11 +238,11 @@ Use the provided `benchmark.py` (updated for the new bool-return `decode_into` A
 
 | Quality | FPS (RGB888) |
 |--------:|--------------:|
-| 100     | 40.52 |
-| 90      | 56.02 |
-| 80      | 60.86 |
-| 70      | 63.29 |
-| 60      | 65.02 |
+| 100     | 10.95 |
+| 90      | 16.88 |
+| 80      | 19.18 |
+| 70      | 20.23 |
+| 60      | 22.46 |
 
 ---
 

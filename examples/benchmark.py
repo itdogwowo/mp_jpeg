@@ -1,123 +1,286 @@
-from time import ticks_ms
-import jpeg
+import sys
 import gc
 
-NR = 100
-IMG_PATH = "000.jpeg"
+try:
+    from time import ticks_ms, ticks_diff
+except ImportError:
+    import time
 
-with open(IMG_PATH, "rb") as f:
-    IMG = f.read()
+    def ticks_ms():
+        return int(time.perf_counter() * 1000)
 
-def fps(n, dt_ms):
-    return n * 1000 / dt_ms if dt_ms > 0 else 0.0
+    def ticks_diff(a, b):
+        return a - b
 
-def bpp(fmt):
-    # 依你的 README 格式清單做常用 bpp 推斷
-    if fmt in ("RGB565_BE", "RGB565_LE", "CbYCrY", "YCbYCr"):
+try:
+    import jpeg
+except ImportError:
+    jpeg = None
+
+DEFAULT_IMAGE_PATH = "000.jpeg"
+
+
+def _bpp(pixel_format):
+    if pixel_format in ("RGB565_BE", "RGB565_LE", "CbYCrY", "YCbYCr", "YCbY2YCrY2"):
         return 2
-    if fmt in ("RGB888",):
-        return 3
-    if fmt in ("RGBA",):
-        return 4
-    # fallback
+    if pixel_format in ("RGB888", "RGBA"):
+        return 3 if pixel_format == "RGB888" else 4
+    if pixel_format == "GRAY":
+        return 1
     return 2
 
-def decoder_bench():
+
+def _make_decoder(pixel_format, rotation, block):
+    try:
+        return jpeg.Decoder(pixel_format=pixel_format, rotation=rotation, block=block)
+    except TypeError:
+        return jpeg.Decoder(format=pixel_format, rotation=rotation, block=block)
+
+
+def _make_encoder(height, width, pixel_format, quality, rotation):
+    try:
+        return jpeg.Encoder(height=height, width=width, pixel_format=pixel_format, quality=quality, rotation=rotation)
+    except TypeError:
+        return jpeg.Encoder(height=height, width=width, format=pixel_format, quality=quality, rotation=rotation)
+
+
+def _read_file(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _pick_image_path(argv):
+    if argv:
+        for a in argv:
+            if a and not a.startswith("-"):
+                return a
+    for p in ("image.jpg", "test.jpg", "bigbuckbunny-320x240.jpg", "bigbuckbunny-160x160.jpg"):
+        try:
+            open(p, "rb").close()
+            return p
+        except OSError:
+            pass
+    return None
+
+
+def _parse_int_arg(argv, name, default):
+    prefix = "--%s=" % name
+    for a in argv:
+        if a.startswith(prefix):
+            try:
+                return int(a[len(prefix) :])
+            except ValueError:
+                return default
+    return default
+
+
+def _parse_str_arg(argv, name, default):
+    prefix = "--%s=" % name
+    for a in argv:
+        if a.startswith(prefix):
+            return a[len(prefix) :]
+    return default
+
+
+def _has_flag(argv, name):
+    return ("--%s" % name) in argv
+
+
+def _fps(frames, start_ms, end_ms):
+    dt = ticks_diff(end_ms, start_ms)
+    if dt <= 0:
+        return 0.0
+    return frames * 1000.0 / dt
+
+
+def print_image_info(jpeg_data, formats, rotation):
+    fmt0 = formats[0] if formats else "RGB565_LE"
+
     gc.collect()
-    print("Decoder Benchmark (NEW API)")
-    print("Input Image Size:", len(IMG), "bytes")
+    dec = _make_decoder(fmt0, rotation, False)
+    info = dec.get_img_info(jpeg_data)
+    w, h = info[0], info[1]
 
-    for fmt in ("RGB565_BE", "RGB565_LE", "RGB888", "CbYCrY"):
-        print("\nFormat:", fmt)
-        _bpp = bpp(fmt)
+    blocks = 0
+    block_h = 0
+    try:
+        gc.collect()
+        decb = _make_decoder(fmt0, 0, True)
+        info_b = decb.get_img_info(jpeg_data)
+        if len(info_b) >= 4:
+            blocks = info_b[2]
+            block_h = info_b[3]
+    except Exception:
+        pass
 
-        # ---- 1) normal decode (block=False) ----
-        dec = jpeg.Decoder(pixel_format=fmt, rotation=0, block=False)
-        t0 = ticks_ms()
-        for _ in range(NR):
-            _ = dec.decode(IMG)
-        dt = ticks_ms() - t0
-        print("FPS normal decode (decode, block=False):", "%.2f" % fps(NR, dt))
+    print("Image Width: %d" % w)
+    print("Image Height: %d" % h)
+    print("Rotation: %d" % rotation)
+    if blocks and block_h:
+        print("Blocks: %d" % blocks)
+        print("Block Height: %d" % block_h)
 
-        # ---- 2) block decode (decode, block=True) ----
-        dec = jpeg.Decoder(pixel_format=fmt, rotation=0, block=True)
-        info = dec.get_img_info(IMG)
+    if hasattr(gc, "mem_free"):
+        try:
+            print("GC mem_free: %d" % gc.mem_free())
+            print("GC mem_alloc: %d" % gc.mem_alloc())
+        except Exception:
+            pass
+
+    for fmt in formats:
+        bpp = _bpp(fmt)
+        frame_bytes = w * h * bpp
+        if block_h:
+            block_bytes = w * block_h * bpp
+            print("Format %s: bpp=%d framebuffer=%d bytes block=%d bytes" % (fmt, bpp, frame_bytes, block_bytes))
+        else:
+            print("Format %s: bpp=%d framebuffer=%d bytes" % (fmt, bpp, frame_bytes))
+
+
+def bench_decoder(jpeg_data, nr, formats, rotation):
+    print("Decoder Benchmark")
+    print("Input Image Size: %d bytes" % len(jpeg_data))
+
+    for fmt in formats:
+        print("\nFormat: %s" % fmt)
+        bpp = _bpp(fmt)
+
+        gc.collect()
+        dec = _make_decoder(fmt, rotation, False)
+        start = ticks_ms()
+        for _ in range(nr):
+            _ = dec.decode(jpeg_data)
+        end = ticks_ms()
+        print("FPS normal decode: %.2f" % _fps(nr, start, end))
+
+        gc.collect()
+        dec = _make_decoder(fmt, 0, True)
+        info = dec.get_img_info(jpeg_data)
         w, h, blocks = info[0], info[1], info[2]
 
-        t0 = ticks_ms()
-        for _ in range(NR):
+        start = ticks_ms()
+        for _ in range(nr):
             for _i in range(blocks):
-                _ = dec.decode(IMG)
-        dt = ticks_ms() - t0
-        print("FPS block decode (decode, block=True, blocks=%d):" % blocks, "%.2f" % fps(NR, dt))
+                _ = dec.decode(jpeg_data)
+        end = ticks_ms()
+        print("FPS block decode (%d): %.2f" % (blocks, _fps(nr, start, end)))
 
-        # ---- prepare framebuffer ----
-        fb = bytearray(w * h * _bpp)
-
-        # ---- 3) block decode + Python write (slice copy) ----
-        # 先取一塊推算 block size（只用於 slice 拼接測試）
-        dec_tmp = jpeg.Decoder(pixel_format=fmt, rotation=0, block=True, return_bytes=True)
-        _ = dec_tmp.get_img_info(IMG)
-        blk0 = dec_tmp.decode(IMG)
-        blk_size = len(blk0)
-
-        # 正式測試：每塊 decode() 回 bytes，再 slice 拷貝到 fb
-        dec3 = jpeg.Decoder(pixel_format=fmt, rotation=0, block=True, return_bytes=True)
-        _ = dec3.get_img_info(IMG)
-
-        t0 = ticks_ms()
-        for _ in range(NR):
-            for i in range(blocks):
-                blk = dec3.decode(IMG)
-                off = i * blk_size
-                fb[off:off + blk_size] = blk
-        dt = ticks_ms() - t0
-        print("FPS block decode + write (python slice):", "%.2f" % fps(NR, dt))
-
-        # ---- 4) NEW: decode_into step (blocks=1) ----
-        # 每輪做 blocks 次，每次做 1 block，done 只有最後一次會 True
-        dec4 = jpeg.Decoder(pixel_format=fmt, rotation=0, block=True)
-        _ = dec4.get_img_info(IMG)
-
-        t0 = ticks_ms()
-        for _ in range(NR):
-            for _i in range(blocks):
-                done = dec4.decode_into(IMG, fb, blocks=1)
-        dt = ticks_ms() - t0
-        print("FPS decode_into step (blocks=1):", "%.2f" % fps(NR, dt))
-
-        # ---- 5) NEW: decode_into full (default blocks=0) ----
-        # 每輪只呼叫一次，應該直接完成一輪 (done=True)
-        dec5 = jpeg.Decoder(pixel_format=fmt, rotation=0, block=True)
-        _ = dec5.get_img_info(IMG)
-
-        t0 = ticks_ms()
-        for _ in range(NR):
-            done = dec5.decode_into(IMG, fb)  # default blocks=0 (full)
-            # 理論上 done 應為 True
-        dt = ticks_ms() - t0
-        print("FPS decode_into full (default blocks=0):", "%.2f" % fps(NR, dt))
-
-
-def encoder_bench():
-    print("\nEncoder Benchmark")
-    # 先解成 RGB888 當作 encoder input
-    dec = jpeg.Decoder(pixel_format="RGB888", rotation=0, block=False)
-    info = dec.get_img_info(IMG)
-    w, h = info[0], info[1]
-    img_dec = bytes(dec.decode(IMG))
-    del dec
-    gc.collect()
-
-    for q in (100, 90, 80, 70, 60):
-        enc = jpeg.Encoder(pixel_format="RGB888", quality=q, height=h, width=w)
-        t0 = ticks_ms()
-        for _ in range(NR):
-            _ = enc.encode(img_dec)
-        dt = ticks_ms() - t0
-        print("FPS encode quality %d:" % q, "%.2f" % fps(NR, dt))
         gc.collect()
+        dec = _make_decoder(fmt, 0, True)
+        info = dec.get_img_info(jpeg_data)
+        w, h, blocks = info[0], info[1], info[2]
+        fb = bytearray(w * h * bpp)
+        start = ticks_ms()
+        for _ in range(nr):
+            for i in range(blocks):
+                block = dec.decode(jpeg_data)
+                off = i * len(block)
+                fb[off : off + len(block)] = block
+        end = ticks_ms()
+        print("FPS block decode + write (slice) (%d): %.2f" % (blocks, _fps(nr, start, end)))
+
+        gc.collect()
+        dec = _make_decoder(fmt, 0, True)
+        info = dec.get_img_info(jpeg_data)
+        w, h, blocks = info[0], info[1], info[2]
+        fb = bytearray(w * h * bpp)
+        start = ticks_ms()
+        for _ in range(nr):
+            for _i in range(blocks):
+                _ = dec.decode_into(jpeg_data, fb, blocks=1)
+        end = ticks_ms()
+        print("FPS decode_into step (blocks=1): %.2f" % _fps(nr, start, end))
+
+        gc.collect()
+        dec = _make_decoder(fmt, 0, True)
+        info = dec.get_img_info(jpeg_data)
+        w, h = info[0], info[1]
+        fb = bytearray(w * h * bpp)
+        start = ticks_ms()
+        for _ in range(nr):
+            _ = dec.decode_into(jpeg_data, fb)
+        end = ticks_ms()
+        print("FPS decode_into full (blocks=0): %.2f" % _fps(nr, start, end))
 
 
-decoder_bench()
-encoder_bench()
+def bench_encoder(jpeg_data, nr, quality_list, rotation):
+    print("\nEncoder Benchmark")
+
+    gc.collect()
+    dec = _make_decoder("RGB888", rotation, False)
+    info = dec.get_img_info(jpeg_data)
+    w, h = info[0], info[1]
+    img_raw = bytes(dec.decode(jpeg_data))
+
+    for q in quality_list:
+        gc.collect()
+        enc = _make_encoder(h, w, "RGB888", q, rotation)
+        start = ticks_ms()
+        for _ in range(nr):
+            _ = enc.encode(img_raw)
+        end = ticks_ms()
+        print("FPS encode quality %d: %.2f" % (q, _fps(nr, start, end)))
+
+
+def main():
+    argv = sys.argv[1:]
+
+    if _has_flag(argv, "help") or _has_flag(argv, "h"):
+        print(
+            "Usage: benchmark.py [image.jpg] [--image=path] [--nr=N] [--rotation=0|90|180|270] "
+            "[--formats=CSV] [--qualities=CSV] [--no-encoder]"
+        )
+        return 0
+
+    if jpeg is None:
+        print("jpeg module not found (this benchmark is for MicroPython build with mp_jpeg).")
+        return 2
+
+    img_path = _parse_str_arg(argv, "image", "")
+    if not img_path:
+        img_path = _pick_image_path(argv)
+    if not img_path:
+        img_path = DEFAULT_IMAGE_PATH
+    try:
+        open(img_path, "rb").close()
+    except OSError:
+        print("No JPEG file found. Edit DEFAULT_IMAGE_PATH in benchmark.py or pass: benchmark.py image.jpg")
+        return 2
+
+    nr = _parse_int_arg(argv, "nr", 100)
+    rotation = _parse_int_arg(argv, "rotation", 0)
+
+    fmt_csv = _parse_str_arg(argv, "formats", "RGB565_BE,RGB565_LE,RGB888,CbYCrY")
+    formats = [s.strip() for s in fmt_csv.split(",") if s.strip()]
+    if not formats:
+        formats = ["RGB565_LE"]
+
+    q_csv = _parse_str_arg(argv, "qualities", "100,90,80,70,60")
+    qualities = []
+    for s in q_csv.split(","):
+        s = s.strip()
+        if not s:
+            continue
+        try:
+            qualities.append(int(s))
+        except ValueError:
+            pass
+    if not qualities:
+        qualities = [90]
+
+    jpeg_data = _read_file(img_path)
+
+    print("JPEG Driver Version: %s" % jpeg.version())
+    print("Image: %s" % img_path)
+    print("NR: %d" % nr)
+    print_image_info(jpeg_data, formats, rotation)
+
+    bench_decoder(jpeg_data, nr, formats, rotation)
+
+    if not _has_flag(argv, "no-encoder"):
+        bench_encoder(jpeg_data, nr, qualities, rotation)
+
+    return 0
+
+
+raise SystemExit(main())
